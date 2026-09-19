@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.a
+*.o
+*.so
+*.dylib
+tide-test
+.DS_Store
+

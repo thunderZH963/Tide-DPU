@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.16)
+project(fpdb_tide LANGUAGES CXX)
+
+add_library(fpdb-tide src/tide.cpp)
+target_include_directories(fpdb-tide PUBLIC include)
+target_compile_features(fpdb-tide PUBLIC cxx_std_17)
+target_compile_options(fpdb-tide PRIVATE -Wall -Wextra -Wpedantic)
+
+option(TIDE_BUILD_TESTS "Build Tide unit tests" ON)
+if(TIDE_BUILD_TESTS)
+  enable_testing()
+  add_executable(tide-test tests/tide_test.cpp)
+  target_link_libraries(tide-test PRIVATE fpdb-tide)
+  add_test(NAME tide-test COMMAND tide-test)
+endif()
