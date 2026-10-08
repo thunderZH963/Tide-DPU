@@ -80,9 +80,26 @@ struct TenantSnapshot {
   std::uint32_t credits_in_use{0};
 };
 
+struct AllocationCheckpoint {
+  AllocationId id{0};
+  Generation generation{0};
+  std::uint64_t reserved{0};
+  std::uint64_t occupied{0};
+  bool finished{false};
+};
+
+struct TenantCheckpoint {
+  TenantPolicy policy;
+  double cpu_service_ms{0};
+  std::uint64_t network_bytes{0};
+  AllocationId next_allocation{1};
+  std::vector<AllocationCheckpoint> allocations;
+};
+
 class TenantAccount {
 public:
   explicit TenantAccount(TenantPolicy policy);
+  explicit TenantAccount(const TenantCheckpoint &checkpoint);
 
   std::optional<AllocationId> reserve(std::uint64_t bytes, Generation generation);
   bool materialize(AllocationId allocation, Generation generation, std::uint64_t bytes);
@@ -90,6 +107,8 @@ public:
               double cpu_ms, std::uint64_t network_bytes);
   bool release(AllocationId allocation, Generation generation);
   TenantSnapshot snapshot() const;
+  // Stable account image; the embedding database owns durable storage and replay.
+  TenantCheckpoint checkpoint() const;
 
 private:
   struct Allocation {
@@ -113,6 +132,8 @@ private:
 class ResourceLedger {
 public:
   void registerTenant(const TenantId &tenant, const TenantPolicy &policy);
+  // Restore into a fresh ledger; reject duplicate tenant IDs and invalid counters.
+  void restoreTenant(const TenantId &tenant, const TenantCheckpoint &checkpoint);
   std::shared_ptr<TenantAccount> account(const TenantId &tenant) const;
   std::unordered_map<TenantId, TenantSnapshot> snapshot() const;
 
@@ -227,8 +248,17 @@ private:
   std::uint32_t pullup_slots_in_use_{0};
 };
 
-// Thin hooks used by a TapDB adapter. TupleSet and CAF message types stay outside
-// the Tide core so this module can be linked without Arrow or CAF.
+// Adapter callbacks for a database engine. Native operator and tuple types stay
+// outside the Tide core; the engine maps them to fragment/allocation IDs.
+struct DatabaseHooks {
+  std::function<void(FragmentId, BatchId, Placement)> dispatch;
+  std::function<void(FragmentId)> pause_at_yield;
+  std::function<void(FragmentId, AllocationId)> spill_state_partition;
+  std::function<void(FragmentId, AllocationId)> publish_output;
+  std::function<void(AllocationId, Generation)> on_final_consumer;
+};
+
+// TapDB's existing adapter may retain its HBTable-specific callback name.
 struct TapDBHooks {
   std::function<void(FragmentId, BatchId, Placement)> dispatch;
   std::function<void(FragmentId)> pause_at_yield;

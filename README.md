@@ -16,7 +16,7 @@ Requirements: CMake 3.16 or newer and a C++17 compiler.
 ./scripts/run_tests.sh
 ```
 
-The test executable covers memory reservation and materialization, execution-slot admission, finish/release lifetime separation, stale-generation rejection, weighted scheduling, joint Pushdown/Pullup budgets, and versioned placement commits.
+The test executables cover memory reservation and materialization, execution-slot admission, finish/release lifetime separation, stale-generation rejection, weighted scheduling, joint Pushdown/Pullup budgets, and versioned placement commits. A controlled process-restart fixture reconstructs a saved account and checks retained memory, replayed final release, and monotonic allocation IDs.
 
 ## Scope
 
@@ -25,4 +25,3 @@ The artifact isolates Tide's control-plane mechanisms from CAF, Arrow, and vendo
 ## Anonymity
 
 The repository contains no author names, affiliations, submission identifiers, or machine-specific paths. Please report artifact questions through the anonymous submission channel during review.
-

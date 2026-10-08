@@ -31,8 +31,46 @@ int main() {
   assert(snap.occupied_bytes == 40 && snap.credits_in_use == 1);
   assert(!transport.release("A", acquired.grant->allocation, 2)); // stale
   assert(transport.release("A", acquired.grant->allocation, 3));
+  assert(!transport.release("A", acquired.grant->allocation, 3)); // duplicate
   snap = ledger->account("A")->snapshot();
   assert(snap.occupied_bytes == 0 && snap.reserved_bytes == 0 && snap.credits_in_use == 0);
+
+  // A retained output blocks a new reservation even after its slot returns.
+  auto held = ledger->account("A")->reserve(80, 4);
+  assert(held && ledger->account("A")->materialize(*held, 4, 70));
+  assert(ledger->account("A")->finish(*held, 4, 1.0, 0));
+  assert(!ledger->account("A")->reserve(40, 4));
+  assert(ledger->account("A")->snapshot().occupied_bytes == 70);
+  assert(ledger->account("A")->release(*held, 4));
+  assert(!ledger->account("A")->release(*held, 4));
+  auto after_release = ledger->account("A")->reserve(40, 4);
+  assert(after_release);
+  assert(ledger->account("A")->finish(*after_release, 4, 0, 0));
+  assert(ledger->account("A")->release(*after_release, 4));
+
+  // Simulate a control-process restart from a saved account checkpoint.
+  auto recover_source = std::make_shared<TenantAccount>(TenantPolicy{1.0, 2, 100});
+  auto live_id = recover_source->reserve(80, 7);
+  assert(live_id && recover_source->materialize(*live_id, 7, 70));
+  assert(recover_source->finish(*live_id, 7, 1.25, 128));
+  auto saved = recover_source->checkpoint();
+  recover_source.reset();
+  auto recovered_ledger = std::make_shared<ResourceLedger>();
+  recovered_ledger->restoreTenant("R", saved);
+  auto recovered_scheduler = std::make_shared<HierarchicalScheduler>(recovered_ledger);
+  TransportManager recovered(recovered_ledger, recovered_scheduler, 1, 1);
+  auto recovered_account = recovered_ledger->account("R");
+  assert(recovered_account->snapshot().occupied_bytes == 70);
+  assert(recovered_account->snapshot().reserved_bytes == 10);
+  assert(!recovered_account->reserve(40, 8)); // live output survived restart
+  assert(!recovered.release("R", *live_id, 6)); // stale replay
+  assert(recovered.release("R", *live_id, 7));  // final-consumer replay
+  assert(!recovered.release("R", *live_id, 7)); // duplicate replay
+  auto fresh_id = recovered_account->reserve(40, 8);
+  assert(fresh_id && *fresh_id > *live_id);
+  assert(recovered_account->finish(*fresh_id, 8, 0, 0));
+  assert(recovered_account->release(*fresh_id, 8));
+  assert(recovered_account->snapshot().credits_in_use == 0);
 
   PlacementController controller;
   std::vector<PlacementCandidate> candidates{

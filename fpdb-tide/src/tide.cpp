@@ -7,8 +7,34 @@
 namespace tide {
 
 TenantAccount::TenantAccount(TenantPolicy policy) : policy_(policy) {
-  if (policy_.weight <= 0 || policy_.batch_limit == 0 || policy_.memory_limit_bytes == 0)
+  if (!std::isfinite(policy_.weight) || policy_.weight <= 0 ||
+      policy_.batch_limit == 0 || policy_.memory_limit_bytes == 0)
     throw std::invalid_argument("invalid tenant policy");
+}
+
+TenantAccount::TenantAccount(const TenantCheckpoint &checkpoint)
+    : TenantAccount(checkpoint.policy) {
+  if (checkpoint.next_allocation == 0 ||
+      !std::isfinite(checkpoint.cpu_service_ms) || checkpoint.cpu_service_ms < 0)
+    throw std::invalid_argument("invalid tenant checkpoint");
+  cpu_service_ms_ = checkpoint.cpu_service_ms;
+  network_bytes_ = checkpoint.network_bytes;
+  next_allocation_ = checkpoint.next_allocation;
+  for (const auto &entry : checkpoint.allocations) {
+    if (entry.id == 0 || entry.id >= next_allocation_ ||
+        !allocations_.emplace(entry.id, Allocation{entry.generation, entry.reserved,
+                                                 entry.occupied, entry.finished}).second)
+      throw std::invalid_argument("invalid allocation checkpoint");
+    if (entry.reserved > policy_.memory_limit_bytes - reserved_bytes_ ||
+        entry.occupied > policy_.memory_limit_bytes - occupied_bytes_)
+      throw std::invalid_argument("checkpoint exceeds tenant limit");
+    reserved_bytes_ += entry.reserved;
+    occupied_bytes_ += entry.occupied;
+    ++credits_in_use_;
+  }
+  if (credits_in_use_ > policy_.batch_limit ||
+      reserved_bytes_ > policy_.memory_limit_bytes - occupied_bytes_)
+    throw std::invalid_argument("checkpoint exceeds tenant limit");
 }
 
 std::optional<AllocationId> TenantAccount::reserve(std::uint64_t bytes, Generation generation) {
@@ -68,9 +94,29 @@ TenantSnapshot TenantAccount::snapshot() const {
                         network_bytes_, credits_in_use_};
 }
 
+TenantCheckpoint TenantAccount::checkpoint() const {
+  std::lock_guard<std::mutex> guard(mutex_);
+  TenantCheckpoint copy{policy_, cpu_service_ms_, network_bytes_, next_allocation_, {}};
+  copy.allocations.reserve(allocations_.size());
+  for (const auto &entry : allocations_)
+    copy.allocations.push_back(AllocationCheckpoint{entry.first, entry.second.generation,
+                                                      entry.second.reserved,
+                                                      entry.second.occupied,
+                                                      entry.second.finished});
+  return copy;
+}
+
 void ResourceLedger::registerTenant(const TenantId &tenant, const TenantPolicy &policy) {
   std::lock_guard<std::mutex> guard(mutex_);
   accounts_.try_emplace(tenant, std::make_shared<TenantAccount>(policy));
+}
+
+void ResourceLedger::restoreTenant(const TenantId &tenant,
+                                   const TenantCheckpoint &checkpoint) {
+  auto restored = std::make_shared<TenantAccount>(checkpoint);
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (!accounts_.emplace(tenant, std::move(restored)).second)
+    throw std::invalid_argument("tenant already exists");
 }
 
 std::shared_ptr<TenantAccount> ResourceLedger::account(const TenantId &tenant) const {

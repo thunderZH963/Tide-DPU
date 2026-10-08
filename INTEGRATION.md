@@ -30,3 +30,6 @@ HBTable partitions carry the same tenant, allocation, and generation identifiers
 
 For each bounded cohort of unstarted fragments, provide predicted demand vectors for both Pushdown and Pullup. The Pullup vector includes network traffic. `placeAndCommit` computes against a versioned snapshot and commits the full cohort only if the budget version is unchanged. A stale pass changes no live reservation.
 
+## Account checkpoint fixture
+
+`TenantAccount::checkpoint()` exports the tenant policy, service totals, next allocation ID, and live allocation records. `ResourceLedger::restoreTenant()` validates those records before admitting new work. The `tide-recovery-test` fixture writes this image to a file, terminates the writer process, and restores it in another process. It verifies that retained bytes still block a new grant and that a replayed final release returns credit only once. Production persistence and coordination with query/transport recovery remain the embedding database's responsibility.
