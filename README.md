@@ -1,6 +1,6 @@
-# Tide Artifact
+# Tide Control Library
 
-This anonymous artifact contains the Tide runtime core used by the accompanying EDBT submission. Tide adds tenant-aware scheduling, execution-aware admission, lifetime accounting, and coordinated Pushdown/Pullup placement to a DPU database runtime.
+This repository contains Tide's C++ control-library prototype and tests. Tide adds tenant-aware scheduling, execution-aware admission, lifetime accounting, and coordinated Pushdown/Pullup placement to a DPU database runtime.
 
 ## Contents
 
@@ -25,6 +25,4 @@ After building, run `python3 scripts/run_recovery_bench.py /path/to/tide-recover
 
 The artifact isolates Tide's control-plane mechanisms from CAF, Arrow, and vendor libraries so they can be built and tested on a regular machine. `INTEGRATION.md` describes the adapter boundary used to connect these mechanisms to TapDB. Pushdown executes on the storage-side DPU; Pullup executes on the compute tier.
 
-## Anonymity
-
-The repository contains no author names, affiliations, submission identifiers, or machine-specific paths. Please report artifact questions through the anonymous submission channel during review.
+The library and tests build without TapDB dependencies. `INTEGRATION.md` describes the database hooks; it is an adapter plan, not a complete TapDB integration or a DPU hardware benchmark.
