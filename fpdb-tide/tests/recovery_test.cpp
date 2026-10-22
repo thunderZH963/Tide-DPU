@@ -57,7 +57,7 @@ int main() {
   ledger->restoreTenant("A", saved);
   auto account = ledger->account("A");
   assert(account->snapshot().occupied_bytes == 70);
-  assert(account->snapshot().reserved_bytes == 10);
+  assert(account->snapshot().reserved_bytes == 0);
   assert(!account->reserve(40, 8));
   assert(!account->release(saved.allocations.front().id, 6));
   assert(account->release(saved.allocations.front().id, 7));

@@ -37,7 +37,7 @@ int main() {
       const auto t1 = Clock::now();
       auto account = ledger->account("A");
       assert(account->snapshot().occupied_bytes == count * 70ULL);
-      assert(account->snapshot().reserved_bytes == count * 10ULL);
+      assert(account->snapshot().reserved_bytes == 0);
       for (const auto id : ids) assert(account->release(id, 7));
       const auto t2 = Clock::now();
       assert(account->snapshot().credits_in_use == 0);

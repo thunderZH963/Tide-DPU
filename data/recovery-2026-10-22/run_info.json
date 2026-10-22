@@ -1,0 +1,17 @@
+{
+  "date": "2026-10-22",
+  "scope": "host-side account reconstruction and final-release replay; excludes checkpoint I/O, process startup, query recovery, and DPU execution",
+  "platform": "macOS-15.3.1-x86_64-i386-64bit",
+  "machine": "x86_64",
+  "compiler": "Apple clang version 15.0.0 (clang-1500.3.9.4)",
+  "build_type": "Release",
+  "runs": 5,
+  "warmups_per_count": 10,
+  "trials_per_count_per_run": 100,
+  "finished_allocation": {
+    "occupied_bytes": 70,
+    "reserved_bytes": 0
+  },
+  "base_commit": "c73b514f069f4ced0f2b56fa213e679d6f838077",
+  "source_state": "updated working tree; source files covered by MANIFEST.sha256"
+}

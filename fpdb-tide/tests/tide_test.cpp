@@ -61,7 +61,7 @@ int main() {
   TransportManager recovered(recovered_ledger, recovered_scheduler, 1, 1);
   auto recovered_account = recovered_ledger->account("R");
   assert(recovered_account->snapshot().occupied_bytes == 70);
-  assert(recovered_account->snapshot().reserved_bytes == 10);
+  assert(recovered_account->snapshot().reserved_bytes == 0);
   assert(!recovered_account->reserve(40, 8)); // live output survived restart
   assert(!recovered.release("R", *live_id, 6)); // stale replay
   assert(recovered.release("R", *live_id, 7));  // final-consumer replay

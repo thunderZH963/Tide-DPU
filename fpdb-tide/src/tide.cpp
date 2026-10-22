@@ -6,6 +6,18 @@
 
 namespace tide {
 
+namespace {
+bool validDemand(const ResourceDemand &demand) {
+  return std::isfinite(demand.dpu_cpu_ms) && demand.dpu_cpu_ms >= 0;
+}
+bool validBudget(const SharedBudget &budget) {
+  return std::isfinite(budget.dpu_cpu_ms) && budget.dpu_cpu_ms >= 0;
+}
+bool validPlacement(Placement placement) {
+  return placement == Placement::Pushdown || placement == Placement::Pullup;
+}
+} // namespace
+
 TenantAccount::TenantAccount(TenantPolicy policy) : policy_(policy) {
   if (!std::isfinite(policy_.weight) || policy_.weight <= 0 ||
       policy_.batch_limit == 0 || policy_.memory_limit_bytes == 0)
@@ -21,10 +33,17 @@ TenantAccount::TenantAccount(const TenantCheckpoint &checkpoint)
   network_bytes_ = checkpoint.network_bytes;
   next_allocation_ = checkpoint.next_allocation;
   for (const auto &entry : checkpoint.allocations) {
-    if (entry.id == 0 || entry.id >= next_allocation_ ||
+    if (entry.id == 0 || entry.id >= next_allocation_ || !validPlacement(entry.placement) ||
+        (entry.finished && entry.reserved != 0) ||
         !allocations_.emplace(entry.id, Allocation{entry.generation, entry.reserved,
-                                                 entry.occupied, entry.finished}).second)
+                                                 entry.occupied, entry.finished, {},
+                                                 entry.placement}).second)
       throw std::invalid_argument("invalid allocation checkpoint");
+    auto &spills = allocations_.at(entry.id).spills;
+    for (const auto &spill : entry.spills) {
+      if (spill.first == 0 || spill.second == 0 || !spills.emplace(spill).second)
+        throw std::invalid_argument("invalid spill checkpoint");
+    }
     if (entry.reserved > policy_.memory_limit_bytes - reserved_bytes_ ||
         entry.occupied > policy_.memory_limit_bytes - occupied_bytes_)
       throw std::invalid_argument("checkpoint exceeds tenant limit");
@@ -37,18 +56,35 @@ TenantAccount::TenantAccount(const TenantCheckpoint &checkpoint)
     throw std::invalid_argument("checkpoint exceeds tenant limit");
 }
 
-std::optional<AllocationId> TenantAccount::reserve(std::uint64_t bytes, Generation generation) {
+std::optional<AllocationId> TenantAccount::reserve(std::uint64_t bytes, Generation generation,
+                                                  Placement placement) {
   std::lock_guard<std::mutex> guard(mutex_);
+  if (!validPlacement(placement)) throw std::invalid_argument("invalid allocation placement");
   if (credits_in_use_ >= policy_.batch_limit) return std::nullopt;
+  if (next_allocation_ == std::numeric_limits<AllocationId>::max())
+    return std::nullopt;  // Preserve monotonic IDs; never wrap into a live identity.
   if (occupied_bytes_ > policy_.memory_limit_bytes ||
       reserved_bytes_ > policy_.memory_limit_bytes - occupied_bytes_ ||
       bytes > policy_.memory_limit_bytes - occupied_bytes_ - reserved_bytes_)
     return std::nullopt;
   const auto id = next_allocation_++;
-  allocations_.emplace(id, Allocation{generation, bytes, 0, false});
+  allocations_.emplace(id, Allocation{generation, bytes, 0, false, {}, placement});
   reserved_bytes_ += bytes;
   ++credits_in_use_;
   return id;
+}
+
+bool TenantAccount::reserveMore(AllocationId id, Generation generation, std::uint64_t bytes) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != generation || it->second.finished ||
+      occupied_bytes_ > policy_.memory_limit_bytes ||
+      reserved_bytes_ > policy_.memory_limit_bytes - occupied_bytes_ ||
+      bytes > policy_.memory_limit_bytes - occupied_bytes_ - reserved_bytes_)
+    return false;
+  it->second.reserved += bytes;
+  reserved_bytes_ += bytes;
+  return true;
 }
 
 bool TenantAccount::materialize(AllocationId id, Generation generation, std::uint64_t bytes) {
@@ -64,14 +100,35 @@ bool TenantAccount::materialize(AllocationId id, Generation generation, std::uin
   return true;
 }
 
+bool TenantAccount::spillComplete(AllocationId id, Generation generation,
+                                 SpillId spill, std::uint64_t bytes) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != generation ||
+      spill == 0 || bytes == 0 || bytes > it->second.occupied ||
+      it->second.spills.count(spill) != 0)
+    return false;
+  it->second.spills.emplace(spill, bytes);
+  it->second.occupied -= bytes;
+  occupied_bytes_ -= bytes;
+  return true;
+}
+
 bool TenantAccount::finish(AllocationId id, Generation generation,
                            double cpu_ms, std::uint64_t network_bytes) {
   std::lock_guard<std::mutex> guard(mutex_);
   auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.generation != generation || it->second.finished)
+  if (it == allocations_.end() || it->second.generation != generation || it->second.finished ||
+      !std::isfinite(cpu_ms) || cpu_ms < 0 ||
+      !std::isfinite(cpu_service_ms_ + cpu_ms) ||
+      network_bytes > std::numeric_limits<std::uint64_t>::max() - network_bytes_)
     return false;
   it->second.finished = true;
-  cpu_service_ms_ += std::max(0.0, cpu_ms);
+  // No more output may materialize after completion. Only occupied bytes and
+  // the allocation credit remain live until final-consumer release.
+  reserved_bytes_ -= it->second.reserved;
+  it->second.reserved = 0;
+  cpu_service_ms_ += cpu_ms;
   network_bytes_ += network_bytes;
   return true;
 }
@@ -98,21 +155,31 @@ TenantCheckpoint TenantAccount::checkpoint() const {
   std::lock_guard<std::mutex> guard(mutex_);
   TenantCheckpoint copy{policy_, cpu_service_ms_, network_bytes_, next_allocation_, {}};
   copy.allocations.reserve(allocations_.size());
-  for (const auto &entry : allocations_)
+  for (const auto &entry : allocations_) {
     copy.allocations.push_back(AllocationCheckpoint{entry.first, entry.second.generation,
                                                       entry.second.reserved,
                                                       entry.second.occupied,
-                                                      entry.second.finished});
+                                                      entry.second.finished, {},
+                                                      entry.second.placement});
+    auto &spills = copy.allocations.back().spills;
+    for (const auto &spill : entry.second.spills) spills.push_back(spill);
+    std::sort(spills.begin(), spills.end());
+  }
+  std::sort(copy.allocations.begin(), copy.allocations.end(),
+            [](const auto &a, const auto &b) { return a.id < b.id; });
   return copy;
 }
 
 void ResourceLedger::registerTenant(const TenantId &tenant, const TenantPolicy &policy) {
+  if (tenant.empty()) throw std::invalid_argument("empty tenant ID");
   std::lock_guard<std::mutex> guard(mutex_);
-  accounts_.try_emplace(tenant, std::make_shared<TenantAccount>(policy));
+  if (!accounts_.try_emplace(tenant, std::make_shared<TenantAccount>(policy)).second)
+    throw std::invalid_argument("tenant already exists");
 }
 
 void ResourceLedger::restoreTenant(const TenantId &tenant,
                                    const TenantCheckpoint &checkpoint) {
+  if (tenant.empty()) throw std::invalid_argument("empty tenant ID");
   auto restored = std::make_shared<TenantAccount>(checkpoint);
   std::lock_guard<std::mutex> guard(mutex_);
   if (!accounts_.emplace(tenant, std::move(restored)).second)
@@ -137,51 +204,9 @@ std::unordered_map<TenantId, TenantSnapshot> ResourceLedger::snapshot() const {
   return result;
 }
 
-HierarchicalScheduler::HierarchicalScheduler(std::shared_ptr<ResourceLedger> ledger)
-    : ledger_(std::move(ledger)) {}
-
-void HierarchicalScheduler::enqueue(ReadyBatch batch) {
-  std::lock_guard<std::mutex> guard(mutex_);
-  auto [it, inserted] = queues_.try_emplace(batch.tenant);
-  if (inserted) order_.push_back(batch.tenant);
-  it->second.ready.push_back(std::move(batch));
-}
-
-std::optional<ReadyBatch> HierarchicalScheduler::next() {
-  std::lock_guard<std::mutex> guard(mutex_);
-  if (order_.empty()) return std::nullopt;
-  for (std::size_t attempt = 0; attempt < order_.size() * 3; ++attempt) {
-    const auto &tenant = order_[cursor_++ % order_.size()];
-    auto &state = queues_.at(tenant);
-    if (state.ready.empty()) continue;
-    auto account = ledger_->account(tenant);
-    if (!account) continue;
-    state.deficit += account->snapshot().policy.weight;
-    const auto cost = std::max(0.001, state.ready.front().estimated_service_ms);
-    if (state.deficit < cost) continue;
-    state.deficit -= cost;
-    auto result = state.ready.front();
-    state.ready.pop_front();
-    return result;
-  }
-  // Normalize large service estimates while preserving tenant weights.
-  for (auto &entry : queues_) {
-    if (auto account = ledger_->account(entry.first))
-      entry.second.deficit += account->snapshot().policy.weight * 16.0;
-  }
-  return std::nullopt;
-}
-
-std::size_t HierarchicalScheduler::size() const {
-  std::lock_guard<std::mutex> guard(mutex_);
-  std::size_t total = 0;
-  for (const auto &entry : queues_) total += entry.second.ready.size();
-  return total;
-}
-
 PlacementBudgetLedger::PlacementBudgetLedger(SharedBudget capacity)
     : capacity_(capacity), available_(capacity) {
-  if (capacity.dpu_cpu_ms < 0) throw std::invalid_argument("negative CPU budget");
+  if (!validBudget(capacity)) throw std::invalid_argument("invalid CPU budget");
 }
 
 BudgetSnapshot PlacementBudgetLedger::snapshot() const {
@@ -192,9 +217,13 @@ BudgetSnapshot PlacementBudgetLedger::snapshot() const {
 bool PlacementBudgetLedger::tryCommit(
     std::uint64_t expected_version, const std::vector<PlacementDecision> &decisions) {
   ResourceDemand total;
+  std::unordered_map<FragmentId, bool> seen;
   for (const auto &decision : decisions) {
-    if (decision.reservation.dpu_cpu_ms < 0) return false;
+    if (!validDemand(decision.reservation) || !validPlacement(decision.placement) ||
+        !seen.emplace(decision.fragment, true).second)
+      return false;
     total.dpu_cpu_ms += decision.reservation.dpu_cpu_ms;
+    if (!std::isfinite(total.dpu_cpu_ms)) return false;
     if (decision.reservation.dpu_memory_bytes >
             std::numeric_limits<std::uint64_t>::max() - total.dpu_memory_bytes ||
         decision.reservation.network_bytes >
@@ -208,6 +237,16 @@ bool PlacementBudgetLedger::tryCommit(
       total.dpu_memory_bytes > available_.dpu_memory_bytes ||
       total.network_bytes > available_.network_bytes)
     return false;
+  for (const auto &decision : decisions) {
+    auto prior = generations_.find(decision.fragment);
+    if (reservations_.count(decision.fragment) ||
+        (prior != generations_.end() && decision.generation <= prior->second))
+      return false;
+  }
+  for (const auto &decision : decisions) {
+    reservations_.emplace(decision.fragment, decision);
+    generations_[decision.fragment] = decision.generation;
+  }
   available_.dpu_cpu_ms -= total.dpu_cpu_ms;
   available_.dpu_memory_bytes -= total.dpu_memory_bytes;
   available_.network_bytes -= total.network_bytes;
@@ -215,21 +254,35 @@ bool PlacementBudgetLedger::tryCommit(
   return true;
 }
 
-void PlacementBudgetLedger::release(const ResourceDemand &reservation) {
+bool PlacementBudgetLedger::release(FragmentId fragment, Generation generation) {
   std::lock_guard<std::mutex> guard(mutex_);
+  auto it = reservations_.find(fragment);
+  if (it == reservations_.end() || it->second.generation != generation) return false;
+  const auto &reservation = it->second.reservation;
   available_.dpu_cpu_ms = std::min(capacity_.dpu_cpu_ms,
                                    available_.dpu_cpu_ms + std::max(0.0, reservation.dpu_cpu_ms));
-  available_.dpu_memory_bytes = std::min(
-      capacity_.dpu_memory_bytes, available_.dpu_memory_bytes + reservation.dpu_memory_bytes);
-  available_.network_bytes = std::min(
-      capacity_.network_bytes, available_.network_bytes + reservation.network_bytes);
+  available_.dpu_memory_bytes += reservation.dpu_memory_bytes;
+  available_.network_bytes += reservation.network_bytes;
+  reservations_.erase(it);
   ++version_;
+  return true;
 }
 
 std::vector<PlacementDecision> PlacementController::place(
     std::vector<PlacementCandidate> candidates, const SharedBudget &available) const {
+  if (!validBudget(available)) throw std::invalid_argument("invalid placement budget");
+  std::unordered_map<FragmentId, bool> seen;
+  for (const auto &candidate : candidates) {
+    if (candidate.tenant.empty() || !validDemand(candidate.pushdown) ||
+        !validDemand(candidate.pullup) || !std::isfinite(candidate.pushdown_cost_ms) ||
+        !std::isfinite(candidate.pullup_cost_ms) || candidate.pushdown_cost_ms < 0 ||
+        candidate.pullup_cost_ms < 0 || !seen.emplace(candidate.fragment, true).second)
+      throw std::invalid_argument("invalid or duplicate placement candidate");
+  }
   std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
-    return (a.pullup_cost_ms - a.pushdown_cost_ms) > (b.pullup_cost_ms - b.pushdown_cost_ms);
+    const auto left = a.pullup_cost_ms - a.pushdown_cost_ms;
+    const auto right = b.pullup_cost_ms - b.pushdown_cost_ms;
+    return left != right ? left > right : a.fragment < b.fragment;
   });
   auto remaining = available;
   std::vector<PlacementDecision> decisions;
@@ -249,10 +302,12 @@ std::vector<PlacementDecision> PlacementController::place(
     const bool pushdown_fits = candidate.pushdown_legal && fits(candidate.pushdown, remaining);
     const bool pullup_fits = candidate.pullup_legal && fits(candidate.pullup, remaining);
     if ((prefer_pushdown && pushdown_fits) || (!pullup_fits && pushdown_fits)) {
-      decisions.push_back({candidate.fragment, Placement::Pushdown, candidate.pushdown});
+      decisions.push_back({candidate.fragment, Placement::Pushdown, candidate.pushdown,
+                           candidate.generation});
       reserve(remaining, candidate.pushdown);
     } else if (pullup_fits) {
-      decisions.push_back({candidate.fragment, Placement::Pullup, candidate.pullup});
+      decisions.push_back({candidate.fragment, Placement::Pullup, candidate.pullup,
+                           candidate.generation});
       reserve(remaining, candidate.pullup);
     } else {
       throw std::runtime_error("fragment has no feasible placement");
@@ -276,78 +331,197 @@ std::optional<std::vector<PlacementDecision>> PlacementController::placeAndCommi
 TransportManager::TransportManager(std::shared_ptr<ResourceLedger> ledger,
                                    std::shared_ptr<HierarchicalScheduler> scheduler,
                                    std::uint32_t pushdown_slots,
-                                   std::uint32_t pullup_slots)
+                                   std::uint32_t pullup_slots,
+                                   std::uint64_t pushdown_memory_limit_bytes)
     : ledger_(std::move(ledger)), scheduler_(std::move(scheduler)),
-      pushdown_slot_limit_(pushdown_slots), pullup_slot_limit_(pullup_slots) {
+      pushdown_slot_limit_(pushdown_slots), pullup_slot_limit_(pullup_slots),
+      pushdown_memory_limit_bytes_(pushdown_memory_limit_bytes) {
   if (!ledger_ || !scheduler_ || pushdown_slots == 0 || pullup_slots == 0)
     throw std::invalid_argument("invalid transport manager configuration");
+  for (const auto &tenant : ledger_->snapshot()) {
+    const auto image = ledger_->account(tenant.first)->checkpoint();
+    for (const auto &allocation : image.allocations) {
+      if (!allocation.finished)
+        throw std::invalid_argument("reconcile unfinished backend work before transport startup");
+      if (allocation.placement == Placement::Pushdown) {
+        if (allocation.occupied > pushdown_memory_limit_bytes_ - pushdown_memory_in_use_)
+          throw std::invalid_argument("restored allocations exceed shared DPU memory");
+        pushdown_memory_in_use_ += allocation.occupied;
+      }
+      restored_[tenant.first].emplace(allocation.id, allocation);
+    }
+  }
 }
 
 void TransportManager::open(const FragmentSpec &fragment, Placement placement) {
   std::lock_guard<std::mutex> guard(mutex_);
+  if (!validPlacement(placement)) throw std::invalid_argument("invalid fragment placement");
+  if (!ledger_->account(fragment.tenant))
+    throw std::invalid_argument("unknown fragment tenant");
   if ((placement == Placement::Pushdown && !fragment.pushdown_legal) ||
       (placement == Placement::Pullup && !fragment.pullup_legal))
     throw std::invalid_argument("illegal fragment placement");
   auto existing = fragments_.find(fragment.fragment);
-  if (existing != fragments_.end() && existing->second.spec.generation >= fragment.generation)
-    throw std::invalid_argument("fragment generation must increase");
-  fragments_[fragment.fragment] = FragmentState{fragment, placement, true};
+  if (existing != fragments_.end()) {
+    if (existing->second.spec.tenant != fragment.tenant || existing->second.open ||
+        existing->second.spec.generation >= fragment.generation)
+      throw std::invalid_argument("close and drain fragment before advancing generation");
+    for (const auto &tenant : grants_)
+      for (const auto &entry : tenant.second)
+        if (entry.second.grant.fragment == fragment.fragment)
+          throw std::invalid_argument("fragment still owns live allocations");
+  }
+  fragments_[fragment.fragment] = FragmentState{fragment, placement, true, {}};
 }
 
 AcquireResult TransportManager::acquire(const BatchRequest &request) {
-  Placement placement;
-  {
-    std::lock_guard<std::mutex> guard(mutex_);
-    auto it = fragments_.find(request.fragment);
-    if (it == fragments_.end()) return {AcquireStatus::UnknownFragment, std::nullopt};
-    if (!it->second.open) return {AcquireStatus::Closed, std::nullopt};
-    if (it->second.spec.generation != request.generation || it->second.spec.tenant != request.tenant)
-      return {AcquireStatus::StaleGeneration, std::nullopt};
-    placement = it->second.placement;
-    auto &used = placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
-    const auto limit = placement == Placement::Pushdown ? pushdown_slot_limit_ : pullup_slot_limit_;
-    if (used >= limit) return {AcquireStatus::WouldBlock, std::nullopt};
-    ++used;
-  }
-  auto account = ledger_->account(request.tenant);
-  if (!account) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    auto &used = placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
-    --used;
-    return {AcquireStatus::UnknownFragment, std::nullopt};
-  }
-  auto id = account->reserve(request.memory_bytes, request.generation);
-  if (!id) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    auto &used = placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
-    --used;
+  // Keep close/open, slot admission, and account reservation in one critical
+  // section. No callback is executed while this lock is held.
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto it = fragments_.find(request.fragment);
+  if (it == fragments_.end()) return {AcquireStatus::UnknownFragment, std::nullopt};
+  if (it->second.spec.generation != request.generation || it->second.spec.tenant != request.tenant)
+    return {AcquireStatus::StaleGeneration, std::nullopt};
+  if (!it->second.open) return {AcquireStatus::Closed, std::nullopt};
+  if (it->second.batches.count(request.batch))
+    return {AcquireStatus::DuplicateBatch, std::nullopt};
+  const auto placement = it->second.placement;
+  auto &used = placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
+  const auto limit = placement == Placement::Pushdown ? pushdown_slot_limit_ : pullup_slot_limit_;
+  if (used >= limit) return {AcquireStatus::WouldBlock, std::nullopt};
+  if (placement == Placement::Pushdown &&
+      request.memory_bytes > pushdown_memory_limit_bytes_ - pushdown_memory_in_use_)
     return {AcquireStatus::WouldBlock, std::nullopt};
-  }
-  return {AcquireStatus::Granted,
-          Grant{request.tenant, *id, request.generation, placement, request.memory_bytes}};
+  auto account = ledger_->account(request.tenant);
+  if (!account) return {AcquireStatus::UnknownFragment, std::nullopt};
+  auto id = account->reserve(request.memory_bytes, request.generation, placement);
+  if (!id) return {AcquireStatus::WouldBlock, std::nullopt};
+  Grant grant{request.tenant, *id, request.generation, placement, request.memory_bytes,
+              request.fragment, request.batch};
+  grants_[request.tenant].emplace(*id, GrantState{grant, false, false, request.memory_bytes, 0});
+  it->second.batches.emplace(request.batch, *id);
+  ++used;
+  if (placement == Placement::Pushdown) pushdown_memory_in_use_ += request.memory_bytes;
+  return {AcquireStatus::Granted, grant};
+}
+
+TransportManager::GrantState *TransportManager::findGrant(const Grant &grant) {
+  auto tenant = grants_.find(grant.tenant);
+  if (tenant == grants_.end()) return nullptr;
+  auto it = tenant->second.find(grant.allocation);
+  if (it == tenant->second.end()) return nullptr;
+  const auto &original = it->second.grant;
+  if (original.generation != grant.generation || original.placement != grant.placement ||
+      original.fragment != grant.fragment || original.batch != grant.batch ||
+      original.reserved_bytes != grant.reserved_bytes)
+    return nullptr;
+  return &it->second;
 }
 
 bool TransportManager::push(const Grant &grant, std::uint64_t bytes) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto *state = findGrant(grant);
+  if (!state || state->finished) return false;
   auto account = ledger_->account(grant.tenant);
-  return account && account->materialize(grant.allocation, grant.generation, bytes);
+  if (!account || !account->materialize(grant.allocation, grant.generation, bytes)) return false;
+  state->reserved -= bytes;
+  state->occupied += bytes;
+  return true;
+}
+
+bool TransportManager::extend(const Grant &grant, std::uint64_t bytes) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto *state = findGrant(grant);
+  if (!state || state->finished) return false;
+  if (grant.placement == Placement::Pushdown &&
+      bytes > pushdown_memory_limit_bytes_ - pushdown_memory_in_use_) return false;
+  auto account = ledger_->account(grant.tenant);
+  if (!account || !account->reserveMore(grant.allocation, grant.generation, bytes)) return false;
+  state->reserved += bytes;
+  if (grant.placement == Placement::Pushdown) pushdown_memory_in_use_ += bytes;
+  return true;
+}
+
+bool TransportManager::spillComplete(const Grant &grant, SpillId spill, std::uint64_t bytes) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto *state = findGrant(grant);
+  if (!state) return false;
+  auto account = ledger_->account(grant.tenant);
+  if (!account || !account->spillComplete(grant.allocation, grant.generation, spill, bytes))
+    return false;
+  state->occupied -= bytes;
+  if (grant.placement == Placement::Pushdown) pushdown_memory_in_use_ -= bytes;
+  return true;
 }
 
 bool TransportManager::finish(const TenantId &tenant, const Grant &grant,
                               double cpu_ms, std::uint64_t network_bytes) {
   if (tenant != grant.tenant) return false;
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto *state = findGrant(grant);
+  if (!state || state->finished) return false;
   auto account = ledger_->account(tenant);
   if (!account || !account->finish(grant.allocation, grant.generation, cpu_ms, network_bytes))
     return false;
-  std::lock_guard<std::mutex> guard(mutex_);
-  auto &used = grant.placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
-  if (used > 0) --used;
+  state->finished = true;
+  if (grant.placement == Placement::Pushdown) pushdown_memory_in_use_ -= state->reserved;
+  state->reserved = 0;
+  auto &used = state->grant.placement == Placement::Pushdown ?
+      pushdown_slots_in_use_ : pullup_slots_in_use_;
+  --used;
+  scheduler_->complete(ReadyBatch{tenant, grant.fragment, grant.batch, 1.0, grant.generation}, cpu_ms);
+  if (state->release_pending) {
+    releaseLocked(tenant, grant.allocation, grant.generation);
+  }
   return true;
 }
 
 bool TransportManager::release(const TenantId &tenant, AllocationId allocation,
                                Generation generation) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  return releaseLocked(tenant, allocation, generation);
+}
+
+bool TransportManager::releaseLocked(const TenantId &tenant, AllocationId allocation,
+                                     Generation generation) {
   auto account = ledger_->account(tenant);
-  return account && account->release(allocation, generation);
+  if (!account) return false;
+  auto owner = grants_.find(tenant);
+  if (owner != grants_.end()) {
+    auto live = owner->second.find(allocation);
+    if (live != owner->second.end()) {
+      if (!account->release(allocation, generation)) return false;
+      if (live->second.grant.placement == Placement::Pushdown)
+        pushdown_memory_in_use_ -= live->second.occupied;
+      owner->second.erase(live);
+      return true;
+    }
+  }
+  auto old = restored_.find(tenant);
+  if (old == restored_.end()) return false;
+  auto restored = old->second.find(allocation);
+  if (restored == old->second.end() || !account->release(allocation, generation)) return false;
+  if (restored->second.placement == Placement::Pushdown)
+    pushdown_memory_in_use_ -= restored->second.occupied;
+  old->second.erase(restored);
+  return true;
+}
+
+bool TransportManager::onFinalConsumer(const TenantId &tenant, AllocationId allocation,
+                                       Generation generation) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto account = ledger_->account(tenant);
+  if (!account) return false;
+  auto owner = grants_.find(tenant);
+  if (owner == grants_.end() || !owner->second.count(allocation))
+    return releaseLocked(tenant, allocation, generation);
+  auto &state = owner->second.at(allocation);
+  if (state.grant.generation != generation || state.release_pending) return false;
+  if (!state.finished) {
+    state.release_pending = true;
+    return true;
+  }
+  return releaseLocked(tenant, allocation, generation);
 }
 
 bool TransportManager::close(FragmentId fragment, Generation generation) {
@@ -361,6 +535,11 @@ bool TransportManager::close(FragmentId fragment, Generation generation) {
 std::uint32_t TransportManager::slotsInUse(Placement placement) const {
   std::lock_guard<std::mutex> guard(mutex_);
   return placement == Placement::Pushdown ? pushdown_slots_in_use_ : pullup_slots_in_use_;
+}
+
+std::uint64_t TransportManager::pushdownMemoryInUse() const {
+  std::lock_guard<std::mutex> guard(mutex_);
+  return pushdown_memory_in_use_;
 }
 
 } // namespace tide
