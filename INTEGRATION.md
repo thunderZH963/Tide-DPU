@@ -65,3 +65,60 @@ An account snapshot cannot reconstruct backend execution slots or query state. `
 | HBTable partition reload | Reserve and materialize before consuming resident capacity. |
 
 Scans and filters yield at bounded `TupleSet` boundaries. Join build and partial aggregation preserve their active state until a safe partition boundary; old state stays on its chosen backend. A future unstarted partition or downstream operator may choose Pullup. These hooks are the TapDB adaptation work; the standalone example does not supply CAF or HBTable operator implementations.
+
+## Additional pushdown interfaces
+
+The same control API can be mapped to the following interfaces. These are source/documentation-grounded adapter targets, not claims that the standalone artifact links or benchmarks those database binaries.
+
+| Engine | Admission and yield boundary | Ownership hook to supply |
+|---|---|---|
+| FlexPushdownDB / FPDB-Store | Gate a store task before `FPDBStoreSuperPOp::processAtStore`; dispatch bounded `TupleSet` handlers | Keep merge inputs and output buffers charged until their last readers, independently of `POpContext::notifyComplete`. |
+| Taurus NDP | NDP descriptor, bounded batch read, and page task | Carry the tenant into storage requests; retain cursor-owned pages until frontend consumption. |
+| openGauss NDPPlugin | Offloaded scan-page batch and storage-service response | Account for filtered and native-page response buffers; give compute-side processing its own grant. |
+| PushdownDB / S3 Select | Client request and streamed result batch | Retain client-buffer charges until consumption. Storage CPU and memory enforcement requires provider cooperation. |
+
+For FlexPushdownDB, use the publisher-linked `vldbj_24` branch, inspected at commit `5cb8e1348263a898e832a4a592dd8b147c922524`. Preserve its cache policy, hybrid merge, and Adaptive Pushdown. Actor STOP does not interrupt an in-progress handler; yielding must occur between bounded work units. Its inspected adaptive-rejection path excludes `receiveByOthers_` pipelined results, so that combination needs additional work before an adapter can claim support. Vanilla FPDB must not be described as having TapDB's HBTable spill facility.
+
+Taurus already has an NDP thread pool, page-level bypass, and tenant-related Page Store flow control. Tide would add an explicit lifecycle ledger and joint reservation, rather than introduce the first storage overload mechanism. Taurus/GaussDB for MySQL and openGauss NDPPlugin are different implementations. Native openGauss offloading also requires libsmartscan and its resource-pooling storage environment.
+
+The executable `tide-adapter-contract-test` exercises three standalone frontend contracts: columnar split/merge with two consumers, page output followed by a separately admitted compute continuation, and mixed frontends competing for one shared device-memory budget. It checks result values, retained memory, duplicate requests, and progress after final release. It does not run an SQL engine. Cross-engine manuscript performance curves use explicitly provisional planning inputs, independently of these locally executed checks.
+
+Sources: [FPDB publisher record and artifact](https://link.springer.com/article/10.1007/s00778-024-00867-8), [Taurus NDP](https://doi.org/10.1109/ICDE53745.2022.00170), [openGauss NDPPlugin](https://docs.opengauss.org/en/docs/latest/extension_reference/extension_reference/server/ndpplugin.html), [PushdownDB](https://doi.org/10.1109/ICDE48307.2020.00174).
+
+## Registered output consumers (2026-10-28)
+
+For fan-out, the adapter registers each nonzero consumer ID with
+`TransportManager::registerConsumer(grant, reader)` before publishing output.
+After the producer has exposed its final output, call `sealOutput(grant)`.
+`releaseConsumer(tenant, allocation, generation, reader)` records each reader
+once. Readers may finish before sealing or producer completion. Collection
+requires all three conditions: producer finished, output sealed, no pending
+readers. Until then, occupied memory and the allocation credit remain charged;
+completion can still return the execution slot and unused reservation.
+
+Released reader IDs remain tombstones until the allocation is collected. They
+cannot be registered again. Sealing also rejects subsequent `push`, `extend`,
+and new reader registration. Allocate another batch for subsequent output.
+Zero-reader output uses the same seal/completion rule. Callbacks return whether
+a new event was accepted; duplicate replay can still collect an already-drained
+checkpoint restored before collection. The shared DPU charge is returned once.
+
+`TenantCheckpoint` now includes `tracked_output`, `sealed`, and sorted reader
+ID/released pairs. A database checkpoint serializer must persist these fields
+and version its format; do not decode a new tracked allocation as legacy output.
+The library returns an in-memory image, not a durable file. Quiesce the embedding
+runtime for consistent database/account checkpoints and reconcile unfinished
+backend work before constructing a restored TransportManager. For a finished
+unsealed record, `sealOutput(tenant, allocation, generation)` completes replay.
+
+Legacy adapters may keep `onFinalConsumer` when they already maintain reliable
+reader tracking. Use one lifecycle mode per allocation. Managed readers cannot
+be bypassed through legacy release. No native CAF/Arrow engine integration is
+implied by the standalone tests. The columnar contract fixture now exercises
+core-managed readers directly.
+
+Validation: Debug and ASan/UBSan CTest both pass 8/8 cases. The new case covers
+24 event permutations, malformed checkpoint rejection, sealed/zero-reader
+outputs, released-ID reuse, stale generations, restoration before collection,
+and 100 final-reader/completion races. These are correctness tests, not DPU
+performance measurements.

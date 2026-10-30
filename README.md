@@ -6,7 +6,7 @@ This repository contains Tide's C++ control-library prototype and tests. Tide ad
 
 - `fpdb-tide/`: dependency-free C++17 runtime core, tests, and executable database adapter example.
 - `data/`: historical paper recovery timings; `data/recovery-2026-10-22/` contains a fresh five-run measurement of the updated code and its host/build metadata.
-- `INTEGRATION.md`: mapping from the runtime API to TapDB actors, `TupleSet`, and HBTable.
+- `INTEGRATION.md`: TapDB mapping and required adapter boundaries for FlexPushdownDB, Taurus, openGauss NDPPlugin, and S3 Select.
 - `scripts/run_tests.sh`: clean configure, build, and test command.
 - `scripts/run_recovery_bench.py`: repeat the host-side recovery microbenchmark and save raw and aggregate CSV files.
 
@@ -18,7 +18,7 @@ Requirements: CMake 3.16 or newer and a C++17 compiler.
 ./scripts/run_tests.sh
 ```
 
-The test executables cover weighted service and reconciliation, fragment fanout, debt windows, bounded progress, admission retries, shared device memory, incremental reservations, durable spill/reload, finish/release ordering, stale generations, versioned placement, and concurrent terminal callbacks. A controlled process-restart fixture reconstructs a saved account and checks retained memory, replayed final release, and monotonic allocation IDs. Tests remain active in Release builds.
+The test executables cover weighted service and reconciliation, fragment fanout, debt windows, bounded progress, admission retries, shared device memory, incremental reservations, durable spill/reload, finish/release ordering, stale generations, versioned placement, and concurrent terminal callbacks. A controlled process-restart fixture reconstructs a saved account and checks retained memory, replayed final release, and monotonic allocation IDs. Three adapter-contract scenarios additionally check split/merge readers, a page response with a separately charged compute continuation, and shared-memory contention between frontends. Tests remain active in Release builds.
 After building, run `python3 scripts/run_recovery_bench.py /path/to/tide-recovery-bench /path/to/output --runs 5` to repeat the host-side reconstruction and replay measurements. Each run uses 100 trials after 10 warmups for 1--1024 live allocations. The benchmark excludes checkpoint I/O and process startup.
 
 To retain a build and run the example directly:
@@ -39,6 +39,7 @@ For memory and undefined-behavior checks, configure a separate build with `-DTID
 - `TenantAccount::reserveMore` extends an existing batch allocation without another credit. Failed extensions leave all counters unchanged.
 - `TransportManager::spillComplete` lowers occupied memory only after the database acknowledges a durable spill. Each allocation has unique spill IDs; replayed completions are ignored, including after account restoration.
 - The manager's fifth constructor argument sets the actual shared DPU-memory limit. It checks all tenants' Pushdown allocations atomically and rebuilds retained output charges after restoration; Pullup memory still counts toward its tenant limit.
+- `registerConsumer`, `sealOutput`, and `releaseConsumer` track multi-reader output in the core, including duplicate callbacks and checkpoint replay. See the registered-consumer contract in `INTEGRATION.md`.
 - `finish` returns the execution slot and unused reservation. Occupied output and its allocation credit remain charged until final consumption.
 - `onFinalConsumer` handles either order of completion and consumption. An early consumer event is remembered, and the allocation is released after producer completion.
 - `HierarchicalScheduler::next` selects a tenant by weighted virtual service and then rotates its fragments. `finish` reconciles estimated service with measured service; `defer` rolls back a selection blocked by admission.

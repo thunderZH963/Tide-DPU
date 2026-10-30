@@ -37,8 +37,17 @@ TenantAccount::TenantAccount(const TenantCheckpoint &checkpoint)
         (entry.finished && entry.reserved != 0) ||
         !allocations_.emplace(entry.id, Allocation{entry.generation, entry.reserved,
                                                  entry.occupied, entry.finished, {},
-                                                 entry.placement}).second)
+                                                 entry.placement, false, false, {}}).second)
       throw std::invalid_argument("invalid allocation checkpoint");
+    auto &restored = allocations_.at(entry.id);
+    if (!entry.tracked_output && (entry.sealed || !entry.consumers.empty()))
+      throw std::invalid_argument("invalid output checkpoint mode");
+    restored.tracked_output = entry.tracked_output;
+    restored.sealed = entry.sealed;
+    for (const auto &consumer : entry.consumers) {
+      if (consumer.first == 0 || !restored.consumers.emplace(consumer).second)
+        throw std::invalid_argument("invalid consumer checkpoint");
+    }
     auto &spills = allocations_.at(entry.id).spills;
     for (const auto &spill : entry.spills) {
       if (spill.first == 0 || spill.second == 0 || !spills.emplace(spill).second)
@@ -68,7 +77,7 @@ std::optional<AllocationId> TenantAccount::reserve(std::uint64_t bytes, Generati
       bytes > policy_.memory_limit_bytes - occupied_bytes_ - reserved_bytes_)
     return std::nullopt;
   const auto id = next_allocation_++;
-  allocations_.emplace(id, Allocation{generation, bytes, 0, false, {}, placement});
+  allocations_.emplace(id, Allocation{generation, bytes, 0, false, {}, placement, false, false, {}});
   reserved_bytes_ += bytes;
   ++credits_in_use_;
   return id;
@@ -77,7 +86,7 @@ std::optional<AllocationId> TenantAccount::reserve(std::uint64_t bytes, Generati
 bool TenantAccount::reserveMore(AllocationId id, Generation generation, std::uint64_t bytes) {
   std::lock_guard<std::mutex> guard(mutex_);
   auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.generation != generation || it->second.finished ||
+  if (it == allocations_.end() || it->second.generation != generation || it->second.finished || it->second.sealed ||
       occupied_bytes_ > policy_.memory_limit_bytes ||
       reserved_bytes_ > policy_.memory_limit_bytes - occupied_bytes_ ||
       bytes > policy_.memory_limit_bytes - occupied_bytes_ - reserved_bytes_)
@@ -90,7 +99,7 @@ bool TenantAccount::reserveMore(AllocationId id, Generation generation, std::uin
 bool TenantAccount::materialize(AllocationId id, Generation generation, std::uint64_t bytes) {
   std::lock_guard<std::mutex> guard(mutex_);
   auto it = allocations_.find(id);
-  if (it == allocations_.end() || it->second.generation != generation || it->second.finished ||
+  if (it == allocations_.end() || it->second.generation != generation || it->second.finished || it->second.sealed ||
       bytes > it->second.reserved)
     return false;
   it->second.reserved -= bytes;
@@ -138,11 +147,53 @@ bool TenantAccount::release(AllocationId id, Generation generation) {
   auto it = allocations_.find(id);
   if (it == allocations_.end() || it->second.generation != generation || !it->second.finished)
     return false;
+  if (it->second.tracked_output && (!it->second.sealed ||
+      std::any_of(it->second.consumers.begin(), it->second.consumers.end(),
+                  [](const auto &c) { return !c.second; }))) return false;
   reserved_bytes_ -= it->second.reserved;
   occupied_bytes_ -= it->second.occupied;
   if (credits_in_use_ > 0) --credits_in_use_;
   allocations_.erase(it);
   return true;
+}
+
+bool TenantAccount::registerConsumer(AllocationId id, Generation gen, ConsumerId reader) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != gen || reader == 0 ||
+      it->second.finished || it->second.sealed) return false;
+  auto &a = it->second;
+  if (!a.consumers.emplace(reader, false).second) return false;
+  a.tracked_output = true;
+  return true;
+}
+
+bool TenantAccount::sealOutput(AllocationId id, Generation gen) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != gen || it->second.sealed) return false;
+  it->second.tracked_output = true;
+  it->second.sealed = true;
+  return true;
+}
+
+bool TenantAccount::releaseConsumer(AllocationId id, Generation gen, ConsumerId reader) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = allocations_.find(id);
+  if (it == allocations_.end() || it->second.generation != gen) return false;
+  auto ref = it->second.consumers.find(reader);
+  if (ref == it->second.consumers.end() || ref->second) return false;
+  ref->second = true;
+  return true;
+}
+
+bool TenantAccount::outputReady(AllocationId id, Generation gen) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = allocations_.find(id);
+  return it != allocations_.end() && it->second.generation == gen &&
+    it->second.tracked_output && it->second.sealed &&
+    std::none_of(it->second.consumers.begin(), it->second.consumers.end(),
+                 [](const auto &c) { return !c.second; });
 }
 
 TenantSnapshot TenantAccount::snapshot() const {
@@ -160,7 +211,12 @@ TenantCheckpoint TenantAccount::checkpoint() const {
                                                       entry.second.reserved,
                                                       entry.second.occupied,
                                                       entry.second.finished, {},
-                                                      entry.second.placement});
+                                                      entry.second.placement, false, false, {}});
+    auto &image = copy.allocations.back();
+    image.tracked_output = entry.second.tracked_output;
+    image.sealed = entry.second.sealed;
+    for (const auto &reader : entry.second.consumers) image.consumers.push_back(reader);
+    std::sort(image.consumers.begin(), image.consumers.end());
     auto &spills = copy.allocations.back().spills;
     for (const auto &spill : entry.second.spills) spills.push_back(spill);
     std::sort(spills.begin(), spills.end());
@@ -470,10 +526,58 @@ bool TransportManager::finish(const TenantId &tenant, const Grant &grant,
       pushdown_slots_in_use_ : pullup_slots_in_use_;
   --used;
   scheduler_->complete(ReadyBatch{tenant, grant.fragment, grant.batch, 1.0, grant.generation}, cpu_ms);
-  if (state->release_pending) {
+  if (state->release_pending || account->outputReady(grant.allocation, grant.generation)) {
     releaseLocked(tenant, grant.allocation, grant.generation);
   }
   return true;
+}
+
+bool TransportManager::registerConsumer(const Grant &grant, ConsumerId reader) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto *state = findGrant(grant);
+  if (!state || state->finished || state->release_pending) return false;
+  return ledger_->account(grant.tenant)->registerConsumer(grant.allocation, grant.generation, reader);
+}
+
+void TransportManager::collectOutputLocked(const TenantId &tenant, AllocationId id, Generation gen) {
+  auto account = ledger_->account(tenant);
+  if (!account || !account->outputReady(id, gen)) return;
+  auto owner = grants_.find(tenant);
+  if (owner != grants_.end()) {
+    auto live = owner->second.find(id);
+    if (live != owner->second.end() && !live->second.finished) {
+      live->second.release_pending = true;
+      return;
+    }
+  }
+  releaseLocked(tenant, id, gen);
+}
+
+bool TransportManager::sealOutput(const Grant &grant) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!findGrant(grant)) return false;
+  if (!ledger_->account(grant.tenant)->sealOutput(grant.allocation, grant.generation)) return false;
+  collectOutputLocked(grant.tenant, grant.allocation, grant.generation);
+  return true;
+}
+
+bool TransportManager::sealOutput(const TenantId &tenant, AllocationId id, Generation gen) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto account = ledger_->account(tenant);
+  if (!account || !account->sealOutput(id, gen)) return false;
+  collectOutputLocked(tenant, id, gen);
+  return true;
+}
+
+bool TransportManager::releaseConsumer(const TenantId &tenant, AllocationId id,
+                                      Generation gen, ConsumerId reader) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto account = ledger_->account(tenant);
+  if (!account) return false;
+  const bool accepted = account->releaseConsumer(id, gen, reader);
+  // A restored checkpoint may precede collection but include this ACK.
+  collectOutputLocked(tenant, id, gen);
+  return accepted;
 }
 
 bool TransportManager::release(const TenantId &tenant, AllocationId allocation,

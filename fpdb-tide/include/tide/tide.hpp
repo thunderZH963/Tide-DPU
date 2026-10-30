@@ -20,6 +20,7 @@ using BatchId = std::uint64_t;
 using AllocationId = std::uint64_t;
 using Generation = std::uint64_t;
 using SpillId = std::uint64_t;
+using ConsumerId = std::uint64_t;
 
 struct TenantPolicy {
   double weight{1.0};
@@ -94,6 +95,10 @@ struct AllocationCheckpoint {
   // Durable-spill completions are replay-safe across an account restore.
   std::vector<std::pair<SpillId, std::uint64_t>> spills;
   Placement placement{Placement::Pushdown};
+  bool tracked_output{false};
+  bool sealed{false};
+  // Released IDs are retained as tombstones until allocation collection.
+  std::vector<std::pair<ConsumerId, bool>> consumers;
 };
 
 struct TenantCheckpoint {
@@ -120,6 +125,10 @@ public:
   bool finish(AllocationId allocation, Generation generation,
               double cpu_ms, std::uint64_t network_bytes);
   bool release(AllocationId allocation, Generation generation);
+  bool registerConsumer(AllocationId, Generation, ConsumerId);
+  bool sealOutput(AllocationId, Generation);
+  bool releaseConsumer(AllocationId, Generation, ConsumerId);
+  bool outputReady(AllocationId, Generation) const;
   TenantSnapshot snapshot() const;
   // Stable account image; the embedding database owns durable storage and replay.
   TenantCheckpoint checkpoint() const;
@@ -132,6 +141,9 @@ private:
     bool finished{false};
     std::unordered_map<SpillId, std::uint64_t> spills;
     Placement placement{Placement::Pushdown};
+    bool tracked_output{false};
+    bool sealed{false};
+    std::unordered_map<ConsumerId, bool> consumers;
   };
 
   mutable std::mutex mutex_;
@@ -308,6 +320,12 @@ public:
   void open(const FragmentSpec &fragment, Placement placement);
   AcquireResult acquire(const BatchRequest &request);
   bool push(const Grant &grant, std::uint64_t materialized_bytes);
+  // Register before exposing output. sealOutput forbids new readers/bytes.
+  bool registerConsumer(const Grant &, ConsumerId);
+  bool sealOutput(const Grant &);
+  bool sealOutput(const TenantId &, AllocationId, Generation);
+  // Accepts replayed events for checkpoint-restored allocations.
+  bool releaseConsumer(const TenantId &, AllocationId, Generation, ConsumerId);
   bool extend(const Grant &grant, std::uint64_t additional_bytes);
   bool spillComplete(const Grant &grant, SpillId spill, std::uint64_t durable_bytes);
   bool finish(const TenantId &tenant, const Grant &grant,
@@ -337,6 +355,7 @@ private:
   };
   GrantState *findGrant(const Grant &grant);
   bool releaseLocked(const TenantId &tenant, AllocationId allocation, Generation generation);
+  void collectOutputLocked(const TenantId &, AllocationId, Generation);
 
   std::shared_ptr<ResourceLedger> ledger_;
   std::shared_ptr<HierarchicalScheduler> scheduler_;
