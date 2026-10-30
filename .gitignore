@@ -10,3 +10,9 @@ Testing/
 tide-test
 .DS_Store
 
+
+# Reproducible experiment outputs (regenerate locally)
+/experiment-results/
+/build/
+__pycache__/
+*.pyc

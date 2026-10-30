@@ -1,0 +1,72 @@
+{
+  "source": "fpdb-tide",
+  "sanitize_option": "TIDE_ENABLE_SANITIZERS",
+  "cmake_args": [
+    "-DTIDE_BUILD_TESTS=ON"
+  ],
+  "experiments": {
+    "admission": {
+      "target": "tide-test",
+      "executable": "tide-test",
+      "args": [],
+      "description": "Admission, accounting and placement invariants",
+      "kind": "correctness"
+    },
+    "scheduler": {
+      "target": "tide-scheduler-test",
+      "executable": "tide-scheduler-test",
+      "args": [],
+      "description": "Weighted service, fairness and admission retries",
+      "kind": "correctness"
+    },
+    "lifecycle": {
+      "target": "tide-lifecycle-test",
+      "executable": "tide-lifecycle-test",
+      "args": [],
+      "description": "Producer completion and final release ordering",
+      "kind": "correctness"
+    },
+    "consumers": {
+      "target": "tide-consumer-test",
+      "executable": "tide-consumer-test",
+      "args": [],
+      "description": "Registered multi-reader lifecycle and replay",
+      "kind": "correctness"
+    },
+    "shared-memory": {
+      "target": "tide-shared-memory-test",
+      "executable": "tide-shared-memory-test",
+      "args": [],
+      "description": "Shared device capacity across tenants",
+      "kind": "correctness"
+    },
+    "adapter-contract": {
+      "target": "tide-adapter-contract-test",
+      "executable": "tide-adapter-contract-test",
+      "args": [],
+      "description": "Split/merge and frontend adapter contracts",
+      "kind": "correctness"
+    },
+    "adapter-demo": {
+      "target": "tide-adapter-demo",
+      "executable": "tide-adapter-demo",
+      "args": [],
+      "description": "Filter/group execution with spill and reload",
+      "kind": "correctness"
+    },
+    "recovery": {
+      "target": "tide-recovery-test",
+      "executable": "tide-recovery-test",
+      "args": [],
+      "description": "Checkpoint restore and release replay",
+      "kind": "correctness"
+    },
+    "recovery-bench": {
+      "target": "tide-recovery-bench",
+      "executable": "tide-recovery-bench",
+      "args": [],
+      "description": "Host reconstruction/replay timings; excludes checkpoint I/O",
+      "kind": "host_microbenchmark"
+    }
+  }
+}

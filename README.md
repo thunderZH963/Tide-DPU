@@ -53,3 +53,11 @@ See [INTEGRATION.md](INTEGRATION.md) for call ordering, identity rules, recovery
 The artifact isolates Tide's control-plane mechanisms from CAF, Arrow, and vendor libraries so they can be built and tested on a regular machine. `INTEGRATION.md` describes the adapter boundary used to connect these mechanisms to TapDB. Pushdown executes on the storage-side DPU; Pullup executes on the compute tier.
 
 The library and tests build without TapDB dependencies. The executable example exercises real control-library calls and small native operators. `INTEGRATION.md` describes the TapDB hook mapping; compiling these tests does not establish a complete TapDB integration or a DPU hardware benchmark.
+
+## Reproducible experiment entry points
+
+See [EXPERIMENTS.md](EXPERIMENTS.md) for one script per host experiment, repeated runs, raw logs, build metadata, and the boundary between core checks and hardware experiments.
+
+```sh
+./scripts/experiments/run_all.sh
+```
